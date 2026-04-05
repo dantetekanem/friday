@@ -1,6 +1,6 @@
 # Friday
 
-A [pi](https://github.com/nichochar/pi) package that adds a voice-enabled communications side panel. All conversation routes to a dedicated tmux pane with typewriter effect, text-to-speech, and hands-free voice input via wake word detection.
+A [pi](https://github.com/nichochar/pi) package that adds a dedicated communications side panel. All conversation is routed to a separate tmux pane with typewriter effect, keeping your main window clean for code, diffs, and command output. Optionally enable text-to-speech and hands-free voice input via wake word detection.
 
 ## Installation
 
