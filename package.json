@@ -1,6 +1,6 @@
 {
   "name": "pi-friday",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Voice-enabled communications side panel for pi — wake word detection, TTS, and typewriter text output via a dedicated tmux pane. Stores user data (wake word models, settings) in ~/.pi/agent/friday/.",
   "keywords": ["pi-package"],
   "license": "MIT",

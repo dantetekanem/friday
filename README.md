@@ -5,19 +5,19 @@ A [pi](https://github.com/nichochar/pi) package that adds a voice-enabled commun
 ## Installation
 
 ```bash
-pi install git:github.com/dantetekanem/friday
+pi install npm:pi-friday
 ```
 
-Or for project-local install:
+Or from git:
 
 ```bash
-pi install -l git:github.com/dantetekanem/friday
+pi install git:github.com/dantetekanem/friday
 ```
 
 To try without installing:
 
 ```bash
-pi -e git:github.com/dantetekanem/friday
+pi -e npm:pi-friday
 ```
 
 ## Requirements
