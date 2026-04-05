@@ -1,0 +1,509 @@
+/**
+ * F.R.I.D.A.Y. — Voice-enabled Communications Panel
+ * Main entry point - wires together all modules
+ */
+
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
+import { Text } from "@mariozechner/pi-tui";
+import { mkdirSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { spawn, type ChildProcess } from "node:child_process";
+
+// Module imports
+import { loadSettings, saveSettings, type FridaySettings } from "./settings.js";
+import { 
+	killCurrentVoice, killOrphanTTS, speakText, enqueueVoiceWithMessage, 
+	processVoiceQueueSynced, deriveVoiceText, setLogFunctions,
+	voiceQueue, voicePlaying 
+} from "./voice.js";
+import { 
+	openPanel, killPane, isPaneAlive, ensurePanelOpen, cleanupFiles, 
+	writeMessage, writeMessagePassthrough 
+} from "./panel.js";
+import { 
+	killOrphanDaemons, startWakeDaemon, stopWakeDaemon, startWakeWatcher, 
+	stopWakeWatcher, handleWakeCommand, isDaemonAlive 
+} from "./daemon.js";
+import { scheduleAck, cancelAck, showAndSpeak } from "./acks.js";
+import { buildSystemPrompt } from "./prompt.js";
+
+export default function (pi: ExtensionAPI) {
+
+	// Spawned agents must not use Friday — no communicate tool, no panel, no voice, no acks
+	if (process.env.PI_AGENT_NAME) return;
+
+	// Friday requires tmux — the panel, voice, and daemon all depend on it
+	if (!process.env.TMUX) return;
+
+	// Dependency detection — check what's available on this system
+	const { execSync } = require("node:child_process");
+	function hasCommand(cmd: string): boolean {
+		try { execSync(`which ${cmd}`, { stdio: "ignore" }); return true; } catch { return false; }
+	}
+	const hasPiper = hasCommand("piper");
+	const hasSox = hasCommand("play");
+	const hasVoiceDeps = hasPiper && hasSox;
+	const hasPython = hasCommand("python3");
+
+	// State variables
+	let settings = loadSettings();
+	let enabled = true;
+	let voiceEnabled = hasVoiceDeps && settings.voice.enabled;
+	let paneId: string | null = null;
+	let paneWidth = 40;
+	let communicateCalledThisTurn = false;
+	let wakeDaemon: ChildProcess | null = null;
+	let wakeWatcher: any = null;
+	let lastCommandTimestamp = { value: 0 };
+	let lastMessageTime = { value: 0 };
+	let lastAgentEndTime = 0;
+	let interactionCount = { value: 0 };
+	let lastAckCategory = { value: null as any };
+	let lastAckIndex = { value: -1 };
+	let lastMessageWasQuestion = { value: false };
+	let lastFullMessageText = "";
+	let lastSpokenText = "";
+	let ackTimer = { value: null as ReturnType<typeof setTimeout> | null };
+
+	// Capture our own tmux pane so all tmux commands target the correct window
+	const ownerPaneId: string | null = process.env.TMUX_PANE ?? null;
+	const commsDir = join(tmpdir(), `pi-friday-${process.pid}`);
+	const messagesFile = join(commsDir, "messages.dat");
+	const commandFile = join(commsDir, "wake_command.json");
+
+	// Logging functions
+	const logFile = join(commsDir, "friday.log");
+	function log(msg: string) {
+		try { appendFileSync(logFile, `${new Date().toISOString()} ${msg}\n`); } catch {}
+	}
+
+	function logError(context: string, err: unknown): void {
+		try {
+			const msg = err instanceof Error ? err.message : String(err);
+			log(`ERROR [${context}]: ${msg}`);
+		} catch { /* absolute last resort — swallow silently */ }
+	}
+
+	// Set up logging for voice module
+	setLogFunctions(log, logError);
+
+	// Helper functions
+	function sleep(ms: number): Promise<void> {
+		return new Promise((resolve) => {
+			const t = setTimeout(resolve, ms);
+			t.unref();
+		});
+	}
+
+	async function ensurePanelOpenWrapper(): Promise<boolean> {
+		const result = await ensurePanelOpen(
+			pi, settings, commsDir, messagesFile, ownerPaneId, 
+			paneId, sleep, logError
+		);
+		if (result.success) {
+			paneId = result.paneId;
+			paneWidth = result.paneWidth;
+		}
+		return result.success;
+	}
+
+	function writeMessageWrapper(text: string) {
+		writeMessage(text, messagesFile, paneWidth, settings, lastMessageTime, logError);
+	}
+
+	function writeMessagePassthroughWrapper(text: string) {
+		writeMessagePassthrough(text, messagesFile, paneWidth, logError);
+	}
+
+	function enqueueVoiceWithMessageWrapper(text: string, speed?: number) {
+		enqueueVoiceWithMessage(text, log, logError, speed);
+		if (!voicePlaying) {
+			processVoiceQueueSynced(
+				ensurePanelOpenWrapper,
+				writeMessageWrapper,
+				settings,
+				commsDir,
+				wakeDaemon,
+				lastFullMessageText,
+				lastSpokenText,
+				lastMessageWasQuestion.value,
+				log,
+				logError
+			);
+		}
+	}
+
+	function showAndSpeakWrapper(text: string) {
+		showAndSpeak(
+			text, voiceEnabled, ensurePanelOpenWrapper, writeMessageWrapper,
+			enqueueVoiceWithMessageWrapper, settings, logError
+		);
+	}
+
+	function handleWakeCommandWrapper(text: string) {
+		handleWakeCommand(text, pi, log, logError);
+	}
+
+	// Status helpers
+	function updateStatus(ui: any) {
+		try {
+			if (!enabled) { ui.setStatus("friday", undefined); return; }
+			const name = settings.name.toUpperCase();
+			let status = ui.theme.fg("accent", ` ${name} `);
+			if (hasVoiceDeps && voiceEnabled) status += ui.theme.fg("success", " VOICE ");
+			if (hasPython) {
+				const daemonAlive = isDaemonAlive(wakeDaemon);
+				if (daemonAlive) {
+					status += ui.theme.fg("warning", " DAEMON ON ");
+				} else if (settings.wakeWord.enabled) {
+					status += ui.theme.fg("error", " DAEMON OFF ");
+				}
+			}
+			ui.setStatus("friday", status);
+		} catch (e) { logError("updateStatus", e); }
+	}
+
+	// Daemon management
+	function startWakeDaemonWrapper() {
+		try {
+			if (wakeDaemon) return;
+			wakeDaemon = startWakeDaemon(settings, commsDir, commandFile, log, logError);
+			if (wakeDaemon) {
+				wakeDaemon.on("exit", (code) => {
+					try {
+						log(`Wake daemon exited (code: ${code})`);
+						wakeDaemon = null;
+						stopWakeWatcherWrapper();
+					} catch (e) { logError("wakeDaemon.exit", e); }
+				});
+				startWakeWatcherWrapper();
+			}
+		} catch (e) { logError("startWakeDaemon", e); }
+	}
+
+	function stopWakeDaemonWrapper() {
+		try {
+			stopWakeWatcherWrapper();
+			if (wakeDaemon) {
+				stopWakeDaemon(wakeDaemon, logError);
+				wakeDaemon = null;
+			}
+		} catch (e) { logError("stopWakeDaemon", e); }
+	}
+
+	function startWakeWatcherWrapper() {
+		try {
+			stopWakeWatcherWrapper();
+			wakeWatcher = startWakeWatcher(
+				commandFile, lastCommandTimestamp, killCurrentVoice, 
+				handleWakeCommandWrapper, logError
+			);
+		} catch (e) { logError("startWakeWatcher", e); }
+	}
+
+	function stopWakeWatcherWrapper() {
+		try {
+			if (wakeWatcher) {
+				stopWakeWatcher(wakeWatcher, logError);
+				wakeWatcher = null;
+			}
+		} catch (e) { logError("stopWakeWatcher", e); }
+	}
+
+	// Custom Tool: communicate
+	pi.registerTool({
+		name: "communicate",
+		label: "Comm",
+		description: "Send a direct message to the user via the communications side panel.",
+		promptSnippet: "Send direct messages to the user via the side communications panel",
+		promptGuidelines: [
+			"ALL text goes through communicate. Every word directed at the user. No exceptions.",
+			"The main window is ONLY for visual data: tables, code blocks, SQL, file contents, command output, diffs.",
+			"Messages must be plain text only -- no markdown, no emojis. Write as natural spoken prose.",
+			"You can call communicate multiple times in one turn for separate points.",
+			"Be concise in your responses",
+		],
+		parameters: Type.Object({
+			message: Type.String({ description: "The message to display to the user" }),
+			new_topic: Type.Optional(Type.Boolean({ 
+				description: "Set true when the subject has changed from the previous message." 
+			})),
+			...(hasVoiceDeps ? {
+				voice_summary: Type.Optional(Type.String({ 
+					description: "Optional: a short 1-2 sentence spoken summary for voice output." 
+				})),
+			} : {}),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			try {
+				communicateCalledThisTurn = true;
+
+				if (!enabled) {
+					return {
+						content: [{ type: "text" as const, text: params.message }],
+						details: { delivered: false },
+					};
+				}
+
+				if (!paneId || !(await isPaneAlive(pi, paneId))) {
+					const result = await openPanel(pi, settings, commsDir, messagesFile, ownerPaneId, logError);
+					if (!result.success) {
+						return {
+							content: [{ type: "text" as const, text: params.message }],
+							details: { delivered: false },
+						};
+					}
+					paneId = result.paneId;
+					paneWidth = result.paneWidth;
+					await sleep(500);
+				}
+
+				if (params.new_topic) {
+					lastMessageTime.value = 0;
+				}
+
+				cancelAck(ackTimer);
+
+				if (voiceEnabled) {
+					if (voicePlaying || voiceQueue.length > 0) {
+						killCurrentVoice();
+					}
+					const spoken = deriveVoiceText(params.message, params.voice_summary);
+					lastFullMessageText = params.message;
+					lastSpokenText = spoken;
+					
+					// Wait briefly for playback to start. Cap at 2s to avoid blocking shutdown.
+					let wrote = false;
+					const writeOnce = () => {
+						if (wrote) return;
+						wrote = true;
+						try { writeMessageWrapper(params.message); } catch (e) { logError("communicate.writeMessage", e); }
+					};
+					await new Promise<void>((resolve) => {
+						const timer = setTimeout(() => { writeOnce(); resolve(); }, 2000);
+						timer.unref();
+						const onStart = () => { clearTimeout(timer); writeOnce(); resolve(); };
+						speakText(
+							spoken, settings, commsDir, wakeDaemon, lastFullMessageText, 
+							lastSpokenText, lastMessageWasQuestion.value, log, logError, onStart
+						).finally(() => { clearTimeout(timer); writeOnce(); resolve(); });
+					});
+				} else {
+					writeMessageWrapper(params.message);
+				}
+
+				return {
+					content: [{ type: "text" as const, text: "Message delivered to comms panel." }],
+					details: { delivered: true },
+				};
+			} catch (e) {
+				logError("communicate.execute", e);
+				return {
+					content: [{ type: "text" as const, text: params.message }],
+					details: { delivered: false },
+				};
+			}
+		},
+
+		renderCall(_args, theme, _context) {
+			return new Text(theme.fg("dim", theme.italic("communicating...")), 0, 0);
+		},
+
+		renderResult(result, _options, theme, _context) {
+			try {
+				const delivered = (result as any).details?.delivered;
+				if (delivered) return new Text(theme.fg("dim", "✓ delivered"), 0, 0);
+				return new Text(theme.fg("warning", "⚠ delivered inline"), 0, 0);
+			} catch {
+				return new Text(theme.fg("dim", "✓"), 0, 0);
+			}
+		},
+	});
+
+	// Event handlers and commands
+	pi.on("before_agent_start", async (event) => {
+		try {
+			if (!enabled) return;
+			const result = { systemPrompt: event.systemPrompt + buildSystemPrompt(hasVoiceDeps) };
+			
+			// Schedule acknowledgment
+			const prompt = event.prompt ?? "";
+			if (prompt && !prompt.startsWith("/")) {
+				scheduleAck(
+					prompt, ackTimer, lastMessageWasQuestion, lastAgentEndTime, 
+					interactionCount, lastAckCategory, lastAckIndex, 
+					showAndSpeakWrapper, logError
+				);
+			}
+			return result;
+		} catch (e) { logError("before_agent_start", e); }
+	});
+
+	pi.on("agent_end", async () => {
+		try { lastAgentEndTime = Date.now(); } catch {}
+	});
+
+	pi.on("turn_start", async () => {
+		try { communicateCalledThisTurn = false; } catch {}
+	});
+
+	pi.on("turn_end", async (event) => {
+		try {
+			if (!enabled || communicateCalledThisTurn) return;
+
+			const msg = event.message;
+			if (!msg || msg.role !== "assistant") return;
+
+			const textParts: string[] = [];
+			for (const block of msg.content) {
+				if (block.type === "text" && block.text?.trim()) {
+					textParts.push(block.text.trim());
+				}
+			}
+			if (textParts.length === 0) return;
+
+			const text = textParts.join("\n\n");
+			const ok = await ensurePanelOpenWrapper();
+			if (ok) writeMessagePassthroughWrapper(text);
+		} catch (e) { logError("turn_end.passthrough", e); }
+	});
+
+	// Commands and shortcuts
+	pi.registerCommand("friday", {
+		description: "Usage: /friday [voice|listen|settings]",
+		handler: async (args, ctx) => {
+			try {
+				const arg = (args ?? "").trim().toLowerCase();
+
+				if (arg === "voice") {
+					if (!hasVoiceDeps) {
+						ctx.ui.notify("Voice unavailable — piper and sox (play) required", "error");
+						return;
+					}
+					voiceEnabled = !voiceEnabled;
+					settings.voice.enabled = voiceEnabled;
+					saveSettings(settings);
+					updateStatus(ctx.ui);
+					ctx.ui.notify(voiceEnabled ? "Voice on" : "Voice off", "info");
+					return;
+				}
+
+				if (arg === "listen") {
+					if (!hasPython) {
+						ctx.ui.notify("Wake word listener unavailable — python3 required", "error");
+						return;
+					}
+					if (wakeDaemon) {
+						stopWakeDaemonWrapper();
+						settings.wakeWord.enabled = false;
+						saveSettings(settings);
+						updateStatus(ctx.ui);
+						ctx.ui.notify("Wake word listener off", "info");
+					} else {
+						startWakeDaemonWrapper();
+						settings.wakeWord.enabled = true;
+						saveSettings(settings);
+						updateStatus(ctx.ui);
+						ctx.ui.notify(`Listening for "${settings.wakeWord.model}"`, "info");
+					}
+					return;
+				}
+
+				if (arg === "settings") {
+					settings = loadSettings();
+					const wakeStatus = wakeDaemon ? "on" : "off";
+					const info = [
+						`Name: ${settings.name}`,
+						`Voice: ${voiceEnabled ? "on" : "off"} (model: ${settings.voice.model})`,
+						`Wake word: ${wakeStatus} (model: ${settings.wakeWord.model})`,
+						`Settings file: ${commsDir}/settings.json`,
+					].join("\n");
+					ctx.ui.notify(info, "info");
+					return;
+				}
+
+				enabled = !enabled;
+				if (!enabled) {
+					if (paneId && (await isPaneAlive(pi, paneId))) await killPane(pi, paneId);
+					voiceEnabled = false;
+					stopWakeDaemonWrapper();
+					updateStatus(ctx.ui);
+					ctx.ui.notify(`${settings.name} offline`, "info");
+				} else {
+					updateStatus(ctx.ui);
+					ctx.ui.notify(`${settings.name} online`, "info");
+				}
+			} catch (e) { logError("command.friday", e); }
+		},
+	});
+
+	if (hasVoiceDeps) {
+		pi.registerShortcut("alt+m", {
+			description: "Toggle Friday voice",
+			handler: async (ctx) => {
+				try {
+					killCurrentVoice();
+					voiceEnabled = !voiceEnabled;
+					settings.voice.enabled = voiceEnabled;
+					saveSettings(settings);
+					updateStatus(ctx.ui);
+					ctx.ui.notify(voiceEnabled ? "Voice on" : "Voice off", "info");
+				} catch (e) { logError("shortcut.alt+m", e); }
+			},
+		});
+	}
+
+	if (hasPython) {
+		pi.registerShortcut("alt+l", {
+			description: "Toggle Friday wake word listener",
+			handler: async (ctx) => {
+				try {
+					if (wakeDaemon) {
+						stopWakeDaemonWrapper();
+						settings.wakeWord.enabled = false;
+						saveSettings(settings);
+						updateStatus(ctx.ui);
+						ctx.ui.notify("Wake word listener off", "info");
+					} else {
+						startWakeDaemonWrapper();
+						settings.wakeWord.enabled = true;
+						saveSettings(settings);
+						updateStatus(ctx.ui);
+						ctx.ui.notify(`Listening for "${settings.wakeWord.model}"`, "info");
+					}
+				} catch (e) { logError("shortcut.alt+l", e); }
+			},
+		});
+	}
+
+	// Cleanup
+	pi.on("session_shutdown", async () => {
+			try { killCurrentVoice(); } catch (e) { logError("shutdown.killVoice", e); }
+		try { stopWakeDaemonWrapper(); } catch (e) { logError("shutdown.stopDaemon", e); }
+		try {
+			if (paneId) {
+				const p = spawn("tmux", ["kill-pane", "-t", paneId], { stdio: "ignore" });
+				p.unref();
+				paneId = null;
+			}
+		} catch (e) { logError("shutdown.killPane", e); }
+	});
+
+	// Set initial status
+	pi.on("session_start", async (_event, ctx) => {
+		try {
+				settings = loadSettings();
+			voiceEnabled = hasVoiceDeps && settings.voice.enabled;
+			if (hasVoiceDeps) await killOrphanTTS();
+			if (hasPython && settings.wakeWord.enabled) {
+				await killOrphanDaemons(log);
+				await sleep(500);
+				startWakeDaemonWrapper();
+			}
+			updateStatus(ctx.ui);
+		} catch (e) { logError("session_start", e); }
+	});
+}
