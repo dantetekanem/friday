@@ -2,6 +2,8 @@
 
 A [pi](https://github.com/nichochar/pi) package that adds a dedicated communications side panel. All conversation is routed to a separate tmux pane with typewriter effect, keeping your main window clean for code, diffs, and command output. Optionally enable text-to-speech and hands-free voice input via wake word detection.
 
+<img width="1051" height="505" alt="image" src="https://github.com/user-attachments/assets/8df16a2e-ec71-4876-aad6-5fcae76b5dff" />
+
 ## Installation
 
 ```bash
