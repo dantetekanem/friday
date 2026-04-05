@@ -6,7 +6,7 @@
     "speed": 0.9
   },
   "wakeWord": {
-    "enabled": false,
+    "enabled": true,
     "model": "hey_friday",
     "threshold": 0.3,
     "whisperModel": "tiny.en"

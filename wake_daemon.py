@@ -161,6 +161,7 @@ def main():
     parser.add_argument("--wake-word", default="hey_jarvis", help="Wake word model name")
     parser.add_argument("--threshold", type=float, default=0.5, help="Wake word detection threshold")
     parser.add_argument("--whisper-model", default="tiny.en", help="Whisper model size")
+    parser.add_argument("--data-dir", default=None, help="Directory for custom wake word models")
     args = parser.parse_args()
 
     # Handle shutdown gracefully
@@ -176,9 +177,9 @@ def main():
     log.info(f"Loading wake word model: {args.wake_word}")
     from openwakeword.model import Model as WakeModel
 
-    # Check if it's a custom model file in the extension dir
-    ext_dir = os.path.dirname(os.path.abspath(__file__))
-    custom_model_path = os.path.join(ext_dir, f"{args.wake_word}.onnx")
+    # Check if it's a custom model file in the data dir
+    data_dir = args.data_dir or os.path.join(os.path.expanduser("~"), ".pi/agent/friday")
+    custom_model_path = os.path.join(data_dir, f"{args.wake_word}.onnx")
     if os.path.exists(custom_model_path):
         log.info(f"Using custom model: {custom_model_path}")
         model_ref = custom_model_path

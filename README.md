@@ -1,6 +1,24 @@
 # Friday
 
-A [pi](https://github.com/nichochar/pi) extension that adds a voice-enabled communications side panel. All conversation routes to a dedicated tmux pane with typewriter effect, text-to-speech, and hands-free voice input via wake word detection.
+A [pi](https://github.com/nichochar/pi) package that adds a voice-enabled communications side panel. All conversation routes to a dedicated tmux pane with typewriter effect, text-to-speech, and hands-free voice input via wake word detection.
+
+## Installation
+
+```bash
+pi install git:github.com/dantetekanem/friday
+```
+
+Or for project-local install:
+
+```bash
+pi install -l git:github.com/dantetekanem/friday
+```
+
+To try without installing:
+
+```bash
+pi -e git:github.com/dantetekanem/friday
+```
 
 ## Requirements
 
@@ -48,12 +66,14 @@ The status bar shows active modes: `FRIDAY`, `VOICE`, `DAEMON ON`.
 
 Say the configured wake word (default: "hey friday") to activate hands-free voice input. After detection, Friday records your speech, transcribes it locally with faster-whisper, and sends it as a message to pi.
 
-**Custom wake words:**
+Friday looks for custom wake word models in `~/.pi/agent/friday/`. To set up the default "hey friday" wake word:
 
 1. Visit [openwakeword.com/library](https://openwakeword.com/library) (free, requires sign-in)
-2. Search or create any wake word
-3. Download the `.onnx` file and place it in this extension's directory
+2. Search for **"hey friday"**
+3. Download the `.onnx` file to `~/.pi/agent/friday/`
 4. Set `wakeWord.model` in `settings.json` to the filename without `.onnx`
+
+You can use any custom wake word — just download its `.onnx` model to the same directory.
 
 Built-in models (no download needed): `alexa`, `hey_mycroft`, `hey_jarvis`, `hey_rhasspy`, `timer`, `weather`.
 

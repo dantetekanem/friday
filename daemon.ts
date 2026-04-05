@@ -44,9 +44,11 @@ export function startWakeDaemon(
 		mkdirSync(commsDir, { recursive: true });
 
 		const DAEMON_SCRIPT = join(
-			process.env.HOME ?? "~",
-			".pi/agent/extensions/friday/wake_daemon.py",
+			import.meta.dirname,
+			"wake_daemon.py",
 		);
+
+		const dataDir = join(process.env.HOME ?? "~", ".pi/agent/friday");
 
 		const args = [
 			DAEMON_SCRIPT,
@@ -54,6 +56,7 @@ export function startWakeDaemon(
 			"--wake-word", settings.wakeWord.model,
 			"--threshold", String(settings.wakeWord.threshold),
 			"--whisper-model", settings.wakeWord.whisperModel,
+			"--data-dir", dataDir,
 		];
 
 		const wakeDaemon = spawn("python3", args, {

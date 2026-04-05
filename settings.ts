@@ -46,8 +46,8 @@ export const DEFAULT_SETTINGS: FridaySettings = {
 
 export function getSettingsPath(): string {
 	return join(
-		process.env.HOME ?? "~",
-		".pi/agent/extensions/friday/settings.json",
+		import.meta.dirname,
+		"settings.json",
 	);
 }
 
