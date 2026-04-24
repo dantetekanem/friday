@@ -41,6 +41,18 @@ export function startWakeDaemon(
 	logError: (context: string, err: unknown) => void,
 ): ChildProcess | null {
 	try {
+		// Validate Python dependencies before spawning — avoids brief DAEMON ON flash
+		// when the daemon crashes immediately due to missing modules
+		try {
+			const { execSync } = require("node:child_process");
+			execSync('python3 -c "import openwakeword; import pyaudio"', {
+				stdio: "ignore", timeout: 5000,
+			});
+		} catch {
+			log("Wake daemon skipped — missing Python deps (openwakeword/pyaudio)");
+			return null;
+		}
+
 		mkdirSync(commsDir, { recursive: true });
 
 		const DAEMON_SCRIPT = join(

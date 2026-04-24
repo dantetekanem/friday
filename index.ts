@@ -26,13 +26,13 @@ import {
 	killOrphanDaemons, startWakeDaemon, stopWakeDaemon, startWakeWatcher, 
 	stopWakeWatcher, handleWakeCommand, isDaemonAlive 
 } from "./daemon.js";
-import { scheduleAck, cancelAck, showAndSpeak } from "./acks.js";
+import { scheduleAck, cancelAck, showAndSpeak, loadVoiceAcks } from "./acks.js";
 import { buildSystemPrompt } from "./prompt.js";
 
 export default function (pi: ExtensionAPI) {
 
 	// Spawned agents must not use Friday — no communicate tool, no panel, no voice, no acks
-	if (process.env.PI_AGENT_NAME) return;
+	if (process.env.PI_AGENT_NAME || process.env.PI_TEAM_ROLE) return;
 
 	// Friday requires tmux — the panel, voice, and daemon all depend on it
 	if (!process.env.TMUX) return;
@@ -46,6 +46,11 @@ export default function (pi: ExtensionAPI) {
 	const hasSox = hasCommand("play");
 	const hasVoiceDeps = hasPiper && hasSox;
 	const hasPython = hasCommand("python3");
+	// Check if wake word deps are actually available (not just python3)
+	let hasWakeDeps = false;
+	if (hasPython) {
+		try { execSync('python3 -c "import openwakeword; import pyaudio"', { stdio: "ignore", timeout: 5000 }); hasWakeDeps = true; } catch {}
+	}
 
 	// State variables
 	let settings = loadSettings();
@@ -66,6 +71,7 @@ export default function (pi: ExtensionAPI) {
 	let lastFullMessageText = "";
 	let lastSpokenText = "";
 	let ackTimer = { value: null as ReturnType<typeof setTimeout> | null };
+	let lastUi: any = null;  // Cached UI reference for reactive status updates
 
 	// Capture our own tmux pane so all tmux commands target the correct window
 	const ownerPaneId: string | null = process.env.TMUX_PANE ?? null;
@@ -73,11 +79,15 @@ export default function (pi: ExtensionAPI) {
 	const messagesFile = join(commsDir, "messages.dat");
 	const commandFile = join(commsDir, "wake_command.json");
 
+	// Create commsDir early so log file works from the start
+	mkdirSync(commsDir, { recursive: true });
+
 	// Logging functions
 	const logFile = join(commsDir, "friday.log");
 	function log(msg: string) {
 		try { appendFileSync(logFile, `${new Date().toISOString()} ${msg}\n`); } catch {}
 	}
+	log(`Friday starting: ownerPaneId=${ownerPaneId ?? "null"} pid=${process.pid}`);
 
 	function logError(context: string, err: unknown): void {
 		try {
@@ -100,7 +110,7 @@ export default function (pi: ExtensionAPI) {
 	async function ensurePanelOpenWrapper(): Promise<boolean> {
 		const result = await ensurePanelOpen(
 			pi, settings, commsDir, messagesFile, ownerPaneId, 
-			paneId, sleep, logError
+			paneId, sleep, logError, log
 		);
 		if (result.success) {
 			paneId = result.paneId;
@@ -147,21 +157,25 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Status helpers
-	function updateStatus(ui: any) {
+	function updateStatus(ui?: any) {
 		try {
-			if (!enabled) { ui.setStatus("friday", undefined); return; }
+			const ctx = ui ?? lastUi;
+			if (!ctx) return;
+			if (ui) lastUi = ui;  // Cache for reactive updates
+			if (!enabled) { ctx.setStatus("friday", undefined); return; }
 			const name = settings.name.toUpperCase();
-			let status = ui.theme.fg("accent", ` ${name} `);
-			if (hasVoiceDeps && voiceEnabled) status += ui.theme.fg("success", " VOICE ");
-			if (hasPython) {
-				const daemonAlive = isDaemonAlive(wakeDaemon);
-				if (daemonAlive) {
-					status += ui.theme.fg("warning", " DAEMON ON ");
-				} else if (settings.wakeWord.enabled) {
-					status += ui.theme.fg("error", " DAEMON OFF ");
+			let status = ctx.theme.fg("accent", ` ${name} `);
+			if (hasVoiceDeps && voiceEnabled) status += ctx.theme.fg("success", " VOICE ");
+			// Show daemon status only when the system can actually run it.
+			// If deps are missing, show nothing — the feature doesn't exist here.
+			if (hasWakeDeps) {
+				if (isDaemonAlive(wakeDaemon)) {
+					status += ctx.theme.fg("warning", " DAEMON ON ");
+				} else {
+					status += ctx.theme.fg("error", " DAEMON OFF ");
 				}
 			}
-			ui.setStatus("friday", status);
+			ctx.setStatus("friday", status);
 		} catch (e) { logError("updateStatus", e); }
 	}
 
@@ -176,6 +190,7 @@ export default function (pi: ExtensionAPI) {
 						log(`Wake daemon exited (code: ${code})`);
 						wakeDaemon = null;
 						stopWakeWatcherWrapper();
+						updateStatus();  // Refresh status bar so DAEMON ON clears
 					} catch (e) { logError("wakeDaemon.exit", e); }
 				});
 				startWakeWatcherWrapper();
@@ -242,15 +257,24 @@ export default function (pi: ExtensionAPI) {
 				communicateCalledThisTurn = true;
 
 				if (!enabled) {
+					log("communicate: disabled, delivering inline");
 					return {
 						content: [{ type: "text" as const, text: params.message }],
 						details: { delivered: false },
 					};
 				}
 
-				if (!paneId || !(await isPaneAlive(pi, paneId))) {
-					const result = await openPanel(pi, settings, commsDir, messagesFile, ownerPaneId, logError);
+				if (!paneId || !(await isPaneAlive(pi, paneId, log))) {
+					log(`communicate: panel dead or missing (paneId=${paneId ?? "null"}), opening...`);
+					let result = await openPanel(pi, settings, commsDir, messagesFile, ownerPaneId, logError, log);
 					if (!result.success) {
+						// Retry once after a short delay
+						log("communicate: first openPanel attempt failed, retrying in 500ms...");
+						await sleep(500);
+						result = await openPanel(pi, settings, commsDir, messagesFile, ownerPaneId, logError, log);
+					}
+					if (!result.success) {
+						log("communicate: both openPanel attempts failed, delivering inline");
 						return {
 							content: [{ type: "text" as const, text: params.message }],
 							details: { delivered: false },
@@ -327,6 +351,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => {
 		try {
 			if (!enabled) return;
+			loadVoiceAcks();
 			const result = { systemPrompt: event.systemPrompt + buildSystemPrompt(hasVoiceDeps) };
 			
 			// Schedule acknowledgment
@@ -350,15 +375,19 @@ export default function (pi: ExtensionAPI) {
 		try { communicateCalledThisTurn = false; } catch {}
 	});
 
-	pi.on("turn_end", async (event) => {
+	// Forward assistant text blocks to the panel as they complete streaming.
+	// message_end fires BEFORE tool calls execute, so grey text arrives in the
+	// panel before communicate writes its message. This gives proper ordering:
+	// grey context text first, then the communicate message on top.
+	pi.on("message_end", async (event) => {
 		try {
-			if (!enabled || communicateCalledThisTurn) return;
+			if (!enabled) return;
 
 			const msg = event.message;
 			if (!msg || msg.role !== "assistant") return;
 
 			const textParts: string[] = [];
-			for (const block of msg.content) {
+			for (const block of (msg as any).content ?? []) {
 				if (block.type === "text" && block.text?.trim()) {
 					textParts.push(block.text.trim());
 				}
@@ -368,12 +397,12 @@ export default function (pi: ExtensionAPI) {
 			const text = textParts.join("\n\n");
 			const ok = await ensurePanelOpenWrapper();
 			if (ok) writeMessagePassthroughWrapper(text);
-		} catch (e) { logError("turn_end.passthrough", e); }
+		} catch (e) { logError("message_end.passthrough", e); }
 	});
 
 	// Commands and shortcuts
 	pi.registerCommand("friday", {
-		description: "Usage: /friday [voice|listen|settings]",
+		description: "Usage: /friday [voice|listen|settings|log]",
 		handler: async (args, ctx) => {
 			try {
 				const arg = (args ?? "").trim().toLowerCase();
@@ -392,8 +421,8 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (arg === "listen") {
-					if (!hasPython) {
-						ctx.ui.notify("Wake word listener unavailable — python3 required", "error");
+					if (!hasWakeDeps) {
+						ctx.ui.notify("Wake word listener unavailable — requires python3 + openwakeword + pyaudio", "error");
 						return;
 					}
 					if (wakeDaemon) {
@@ -422,6 +451,19 @@ export default function (pi: ExtensionAPI) {
 						`Settings file: ${commsDir}/settings.json`,
 					].join("\n");
 					ctx.ui.notify(info, "info");
+					return;
+				}
+
+				if (arg === "log") {
+					if (existsSync(logFile)) {
+						const { readFileSync } = require("node:fs");
+						const content = readFileSync(logFile, "utf-8");
+						const lines = content.trim().split("\n");
+						const tail = lines.slice(-30).join("\n");
+						ctx.ui.notify(`Friday log (last 30 lines):\n${tail}`, "info");
+					} else {
+						ctx.ui.notify(`No log file at ${logFile}`, "info");
+					}
 					return;
 				}
 
@@ -456,7 +498,7 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	if (hasPython) {
+	if (hasWakeDeps) {
 		pi.registerShortcut("alt+l", {
 			description: "Toggle Friday wake word listener",
 			handler: async (ctx) => {
@@ -496,9 +538,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		try {
 				settings = loadSettings();
+			loadVoiceAcks();
 			voiceEnabled = hasVoiceDeps && settings.voice.enabled;
 			if (hasVoiceDeps) await killOrphanTTS();
-			if (hasPython && settings.wakeWord.enabled) {
+			if (hasWakeDeps && settings.wakeWord.enabled) {
 				await killOrphanDaemons(log);
 				await sleep(500);
 				startWakeDaemonWrapper();

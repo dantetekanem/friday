@@ -1,12 +1,20 @@
 /**
  * Friday Extension - Acknowledgment System Module
  * Acknowledgment phrases, classification, scheduling, and delivery
+ *
+ * Supports custom per-voice acks via the persona extension.
+ * Reads ~/.pi/agent/persona/settings.json for a voiceAckPath field
+ * pointing to a directory of {voice}.json ack files.
+ * Falls back to built-in defaults when no custom acks are found.
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import type { ChildProcess } from "node:child_process";
 import type { FridaySettings } from "./settings.js";
 
-export const PANEL_PHRASES = [
+const DEFAULT_PANEL_PHRASES = [
 	`Full details in the panel.`,
 	`More in the panel if you need it.`,
 	`Rest is on screen.`,
@@ -15,7 +23,7 @@ export const PANEL_PHRASES = [
 
 export type AckCategory = "investigate" | "build" | "research" | "fix" | "general" | "question";
 
-export const ACK_PHRASES: Record<AckCategory, string[]> = {
+const DEFAULT_ACK_PHRASES: Record<AckCategory, string[]> = {
 	investigate: [
 		"Looking into it.", "Let me check.", "Starting the investigation.",
 		"Pulling up the details now.", "Let me trace through that.",
@@ -45,6 +53,52 @@ export const ACK_PHRASES: Record<AckCategory, string[]> = {
 		"Let me find out.", "Checking.",
 	],
 };
+
+/** Active ack phrases — may be overridden by persona voice acks */
+export let ACK_PHRASES: Record<AckCategory, string[]> = { ...DEFAULT_ACK_PHRASES };
+export let PANEL_PHRASES: string[] = [...DEFAULT_PANEL_PHRASES];
+
+const PERSONA_SETTINGS_PATH = join(homedir(), ".pi", "agent", "persona", "settings.json");
+
+/**
+ * Load custom ack phrases from the persona extension's voice-acks directory.
+ * Reads persona/settings.json → voiceAckPath → {voice}.json.
+ * Falls back to defaults if anything is missing.
+ */
+export function loadVoiceAcks(): void {
+	try {
+		if (!existsSync(PERSONA_SETTINGS_PATH)) return;
+		const settings = JSON.parse(readFileSync(PERSONA_SETTINGS_PATH, "utf-8"));
+		const ackPath = settings.voiceAckPath;
+		const voice = settings.voice;
+		if (!ackPath || !voice) return;
+
+		const ackFile = join(ackPath, `${voice}.json`);
+		if (!existsSync(ackFile)) return;
+
+		const custom = JSON.parse(readFileSync(ackFile, "utf-8"));
+
+		// Merge: override only categories present in the custom file
+		const merged = { ...DEFAULT_ACK_PHRASES };
+		for (const cat of Object.keys(DEFAULT_ACK_PHRASES) as AckCategory[]) {
+			if (Array.isArray(custom[cat]) && custom[cat].length > 0) {
+				merged[cat] = custom[cat];
+			}
+		}
+		ACK_PHRASES = merged;
+
+		// Panel phrases
+		if (Array.isArray(custom.panel) && custom.panel.length > 0) {
+			PANEL_PHRASES = custom.panel;
+		} else {
+			PANEL_PHRASES = [...DEFAULT_PANEL_PHRASES];
+		}
+	} catch {
+		// Any failure — silently fall back to defaults
+		ACK_PHRASES = { ...DEFAULT_ACK_PHRASES };
+		PANEL_PHRASES = [...DEFAULT_PANEL_PHRASES];
+	}
+}
 
 export const ACK_PATTERNS: { pattern: RegExp; category: AckCategory }[] = [
 	{ pattern: /\b(investigat|diagnos|debug|check|look into|what.s wrong|why is|trace)\b/i, category: "investigate" },
