@@ -3,9 +3,9 @@
  * Main entry point - wires together all modules
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@mariozechner/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { mkdirSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -28,6 +28,7 @@ import {
 } from "./daemon.js";
 import { scheduleAck, cancelAck, showAndSpeak, loadVoiceAcks } from "./acks.js";
 import { buildSystemPrompt } from "./prompt.js";
+import { registerFridayTodo } from "./todo.js";
 
 export default function (pi: ExtensionAPI) {
 
@@ -38,7 +39,7 @@ export default function (pi: ExtensionAPI) {
 	if (!process.env.TMUX) return;
 
 	// Dependency detection — check what's available on this system
-	const { execSync } = require("node:child_process");
+	const { execSync, execFileSync } = require("node:child_process");
 	function hasCommand(cmd: string): boolean {
 		try { execSync(`which ${cmd}`, { stdio: "ignore" }); return true; } catch { return false; }
 	}
@@ -57,6 +58,7 @@ export default function (pi: ExtensionAPI) {
 	let enabled = true;
 	let voiceEnabled = hasVoiceDeps && settings.voice.enabled;
 	let paneId: string | null = null;
+	let todoPaneId: string | null = null;
 	let paneWidth = 40;
 	let communicateCalledThisTurn = false;
 	let wakeDaemon: ChildProcess | null = null;
@@ -77,6 +79,7 @@ export default function (pi: ExtensionAPI) {
 	const ownerPaneId: string | null = process.env.TMUX_PANE ?? null;
 	const commsDir = join(tmpdir(), `pi-friday-${process.pid}`);
 	const messagesFile = join(commsDir, "messages.dat");
+	const todosFile = join(commsDir, "todos.dat");
 	const commandFile = join(commsDir, "wake_command.json");
 
 	// Create commsDir early so log file works from the start
@@ -96,6 +99,40 @@ export default function (pi: ExtensionAPI) {
 		} catch { /* absolute last resort — swallow silently */ }
 	}
 
+	function cleanupOldFridayPanesInCurrentWindow(): void {
+		try {
+			if (!ownerPaneId || !process.env.TMUX) return;
+			const panes = execFileSync("tmux", [
+				"list-panes", "-t", ownerPaneId, "-F", "#{pane_id}\t#{pane_pid}\t#{pane_current_command}",
+			], { encoding: "utf-8" });
+			for (const line of String(panes).trim().split("\n")) {
+				if (!line.trim()) continue;
+				const [paneIdToCheck, panePid, paneCommand] = line.split("\t");
+				if (!paneIdToCheck || !panePid || paneIdToCheck === ownerPaneId || paneCommand !== "perl") continue;
+				let command = "";
+				try {
+					command = execFileSync("ps", ["-p", panePid, "-o", "command="], { encoding: "utf-8" }).trim();
+				} catch {
+					continue;
+				}
+				const isFridayPane = command.includes("/pi-friday-") && (command.includes("/display.pl") || command.includes("/todos.pl"));
+				const isCurrentPane = command.includes(commsDir);
+				if (isFridayPane && !isCurrentPane) {
+					try {
+						execFileSync("tmux", ["kill-pane", "-t", paneIdToCheck], { stdio: "ignore" });
+						log(`Cleaned stale Friday pane ${paneIdToCheck}`);
+					} catch (err) {
+						logError("cleanupOldFridayPanes.kill", err);
+					}
+				}
+			}
+		} catch (err) {
+			logError("cleanupOldFridayPanes", err);
+		}
+	}
+
+	cleanupOldFridayPanesInCurrentWindow();
+
 	// Set up logging for voice module
 	setLogFunctions(log, logError);
 
@@ -109,11 +146,12 @@ export default function (pi: ExtensionAPI) {
 
 	async function ensurePanelOpenWrapper(): Promise<boolean> {
 		const result = await ensurePanelOpen(
-			pi, settings, commsDir, messagesFile, ownerPaneId, 
-			paneId, sleep, logError, log
+			pi, settings, commsDir, messagesFile, todosFile, ownerPaneId,
+			paneId, todoPaneId, sleep, logError, log
 		);
 		if (result.success) {
 			paneId = result.paneId;
+			todoPaneId = result.todoPaneId;
 			paneWidth = result.paneWidth;
 		}
 		return result.success;
@@ -126,6 +164,8 @@ export default function (pi: ExtensionAPI) {
 	function writeMessagePassthroughWrapper(text: string) {
 		writeMessagePassthrough(text, messagesFile, paneWidth, logError);
 	}
+
+	registerFridayTodo(pi, { todosFile, logError });
 
 	function enqueueVoiceWithMessageWrapper(text: string, speed?: number, standalone?: boolean) {
 		enqueueVoiceWithMessage(text, log, logError, speed, standalone);
@@ -162,20 +202,7 @@ export default function (pi: ExtensionAPI) {
 			const ctx = ui ?? lastUi;
 			if (!ctx) return;
 			if (ui) lastUi = ui;  // Cache for reactive updates
-			if (!enabled) { ctx.setStatus("friday", undefined); return; }
-			const name = settings.name.toUpperCase();
-			let status = ctx.theme.fg("accent", ` ${name} `);
-			if (hasVoiceDeps && voiceEnabled) status += ctx.theme.fg("success", " VOICE ");
-			// Show daemon status only when the system can actually run it.
-			// If deps are missing, show nothing — the feature doesn't exist here.
-			if (hasWakeDeps) {
-				if (isDaemonAlive(wakeDaemon)) {
-					status += ctx.theme.fg("warning", " DAEMON ON ");
-				} else {
-					status += ctx.theme.fg("error", " DAEMON OFF ");
-				}
-			}
-			ctx.setStatus("friday", status);
+			ctx.setStatus("friday", undefined);
 		} catch (e) { logError("updateStatus", e); }
 	}
 
@@ -266,12 +293,12 @@ export default function (pi: ExtensionAPI) {
 
 				if (!paneId || !(await isPaneAlive(pi, paneId, log))) {
 					log(`communicate: panel dead or missing (paneId=${paneId ?? "null"}), opening...`);
-					let result = await openPanel(pi, settings, commsDir, messagesFile, ownerPaneId, logError, log);
+					let result = await openPanel(pi, settings, commsDir, messagesFile, todosFile, ownerPaneId, logError, log);
 					if (!result.success) {
 						// Retry once after a short delay
 						log("communicate: first openPanel attempt failed, retrying in 500ms...");
 						await sleep(500);
-						result = await openPanel(pi, settings, commsDir, messagesFile, ownerPaneId, logError, log);
+						result = await openPanel(pi, settings, commsDir, messagesFile, todosFile, ownerPaneId, logError, log);
 					}
 					if (!result.success) {
 						log("communicate: both openPanel attempts failed, delivering inline");
@@ -281,6 +308,7 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 					paneId = result.paneId;
+					todoPaneId = result.todoPaneId;
 					paneWidth = result.paneWidth;
 					await sleep(500);
 				}
@@ -333,16 +361,20 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(_args, theme, _context) {
-			return new Text(theme.fg("dim", theme.italic("communicating...")), 0, 0);
+			return new Text(
+				theme.fg("toolTitle", theme.bold("communicate ")) + theme.fg("accent", "sending message"),
+				0,
+				0,
+			);
 		},
 
 		renderResult(result, _options, theme, _context) {
 			try {
 				const delivered = (result as any).details?.delivered;
-				if (delivered) return new Text(theme.fg("dim", "✓ delivered"), 0, 0);
+				if (delivered) return new Text(theme.fg("success", "✓ delivered"), 0, 0);
 				return new Text(theme.fg("warning", "⚠ delivered inline"), 0, 0);
 			} catch {
-				return new Text(theme.fg("dim", "✓"), 0, 0);
+				return new Text(theme.fg("success", "✓"), 0, 0);
 			}
 		},
 	});
@@ -469,7 +501,10 @@ export default function (pi: ExtensionAPI) {
 
 				enabled = !enabled;
 				if (!enabled) {
+					if (todoPaneId && (await isPaneAlive(pi, todoPaneId))) await killPane(pi, todoPaneId);
+					todoPaneId = null;
 					if (paneId && (await isPaneAlive(pi, paneId))) await killPane(pi, paneId);
+					paneId = null;
 					voiceEnabled = false;
 					stopWakeDaemonWrapper();
 					updateStatus(ctx.ui);
@@ -526,6 +561,11 @@ export default function (pi: ExtensionAPI) {
 			try { killCurrentVoice(); } catch (e) { logError("shutdown.killVoice", e); }
 		try { stopWakeDaemonWrapper(); } catch (e) { logError("shutdown.stopDaemon", e); }
 		try {
+			if (todoPaneId) {
+				const p = spawn("tmux", ["kill-pane", "-t", todoPaneId], { stdio: "ignore" });
+				p.unref();
+				todoPaneId = null;
+			}
 			if (paneId) {
 				const p = spawn("tmux", ["kill-pane", "-t", paneId], { stdio: "ignore" });
 				p.unref();

@@ -1,28 +1,79 @@
 /**
  * Friday Extension - Panel Management Module
- * Tmux panel operations, message writing, and display script
+ * Tmux panel operations, message writing, and display scripts
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { writeFileSync, mkdirSync, appendFileSync, rmSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, appendFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { FridaySettings } from "./settings.js";
 
 export type MessageStackMode = "normal" | "standalone";
+
+type PanelOpenResult = { success: boolean; paneId: string | null; todoPaneId: string | null; paneWidth: number };
+
+function getTodoPaneHeight(todosFile: string): number {
+	try {
+		if (!existsSync(todosFile)) return 1;
+		const content = readFileSync(todosFile, "utf-8").trim();
+		if (!content) return 1;
+		const lineCount = content.split("\n").filter((line) => line.length > 0).length;
+		return Math.max(1, Math.min(14, lineCount + 2));
+	} catch {
+		return 1;
+	}
+}
+
+async function openTodoPane(
+	pi: ExtensionAPI,
+	commsDir: string,
+	todosFile: string,
+	parentPaneId: string,
+	logError: (context: string, err: unknown) => void,
+): Promise<string | null> {
+	try {
+		if (!existsSync(todosFile)) writeFileSync(todosFile, "");
+		const todoScript = join(commsDir, "todos.pl");
+		writeFileSync(todoScript, buildTodoDisplayScript(), { mode: 0o755 });
+
+		const result = await pi.exec("tmux", [
+			"split-window", "-v", "-d", "-t", parentPaneId,
+			"-l", String(getTodoPaneHeight(todosFile)),
+			"-P", "-F", "#{pane_id}",
+			"perl", todoScript, todosFile,
+		]);
+		const todoPaneId = result.stdout.trim();
+		if (!todoPaneId || result.code !== 0) return null;
+
+		try {
+			await pi.exec("tmux", ["set-option", "-p", "-t", todoPaneId, "allow-passthrough", "on"]);
+			await pi.exec("tmux", ["set-option", "-p", "-t", todoPaneId, "@friday_role", "todo"]);
+			await pi.exec("tmux", ["set-option", "-p", "-t", todoPaneId, "@friday_parent", parentPaneId]);
+		} catch { /* non-critical */ }
+
+		return todoPaneId;
+	} catch (e) {
+		logError("openTodoPane", e);
+		return null;
+	}
+}
 
 export async function openPanel(
 	pi: ExtensionAPI,
 	settings: FridaySettings,
 	commsDir: string,
 	messagesFile: string,
+	todosFile: string,
 	ownerPaneId: string | null,
 	logError: (context: string, err: unknown) => void,
-): Promise<{ success: boolean; paneId: string | null; paneWidth: number }> {
+	_log?: (message: string) => void,
+): Promise<PanelOpenResult> {
 	try {
-		if (!process.env.TMUX) return { success: false, paneId: null, paneWidth: 38 };
+		if (!process.env.TMUX) return { success: false, paneId: null, todoPaneId: null, paneWidth: 38 };
 
 		mkdirSync(commsDir, { recursive: true });
 		writeFileSync(messagesFile, "");
+		if (!existsSync(todosFile)) writeFileSync(todosFile, "");
 
 		const displayScript = join(commsDir, "display.pl");
 		writeFileSync(displayScript, buildDisplayScript(), { mode: 0o755 });
@@ -72,14 +123,18 @@ export async function openPanel(
 
 		if (!paneId || result.code !== 0) {
 			cleanupFiles(commsDir);
-			return { success: false, paneId: null, paneWidth: 38 };
+			return { success: false, paneId: null, todoPaneId: null, paneWidth: 38 };
 		}
 
 		try {
 			await pi.exec("tmux", [
 				"set-option", "-p", "-t", paneId, "allow-passthrough", "on",
 			]);
+			await pi.exec("tmux", ["set-option", "-p", "-t", paneId, "@friday_role", "comms"]);
+			if (ownerPaneId) await pi.exec("tmux", ["set-option", "-p", "-t", paneId, "@friday_owner", ownerPaneId]);
 		} catch { /* non-critical */ }
+
+		const todoPaneId = await openTodoPane(pi, commsDir, todosFile, paneId, logError);
 
 		let paneWidth: number;
 		try {
@@ -91,10 +146,10 @@ export async function openPanel(
 			paneWidth = 38;
 		}
 
-		return { success: true, paneId, paneWidth };
+		return { success: true, paneId, todoPaneId, paneWidth };
 	} catch (e) {
 		logError("openPanel", e);
-		return { success: false, paneId: null, paneWidth: 38 };
+		return { success: false, paneId: null, todoPaneId: null, paneWidth: 38 };
 	}
 }
 
@@ -119,14 +174,21 @@ export async function ensurePanelOpen(
 	settings: FridaySettings,
 	commsDir: string,
 	messagesFile: string,
+	todosFile: string,
 	ownerPaneId: string | null,
 	paneId: string | null,
+	todoPaneId: string | null,
 	sleep: (ms: number) => Promise<void>,
 	logError: (context: string, err: unknown) => void,
-): Promise<{ success: boolean; paneId: string | null; paneWidth: number }> {
+	_log?: (message: string) => void,
+): Promise<PanelOpenResult> {
 	try {
 		if (paneId && (await isPaneAlive(pi, paneId))) {
-			// Get current pane width
+			let nextTodoPaneId = todoPaneId;
+			if (!(await isPaneAlive(pi, nextTodoPaneId))) {
+				nextTodoPaneId = await openTodoPane(pi, commsDir, todosFile, paneId, logError);
+			}
+
 			let paneWidth: number;
 			try {
 				const w = await pi.exec("tmux", [
@@ -136,14 +198,14 @@ export async function ensurePanelOpen(
 			} catch {
 				paneWidth = 38;
 			}
-			return { success: true, paneId, paneWidth };
+			return { success: true, paneId, todoPaneId: nextTodoPaneId, paneWidth };
 		}
-		const result = await openPanel(pi, settings, commsDir, messagesFile, ownerPaneId, logError);
+		const result = await openPanel(pi, settings, commsDir, messagesFile, todosFile, ownerPaneId, logError);
 		if (result.success) await sleep(500);
 		return result;
 	} catch (e) {
 		logError("ensurePanelOpen", e);
-		return { success: false, paneId: null, paneWidth: 38 };
+		return { success: false, paneId: null, todoPaneId: null, paneWidth: 38 };
 	}
 }
 
@@ -241,6 +303,68 @@ export function wordWrap(text: string, width: number): string[] {
 	}
 
 	return lines;
+}
+
+export function buildTodoDisplayScript(): string {
+	return `#!/usr/bin/perl
+use strict;
+use warnings;
+
+$| = 1;
+binmode(STDOUT, ':utf8');
+
+my $file = $ARGV[0] or die "Usage: $0 <todos-file>\\n";
+my $last = '';
+my $left_pad = '  ';
+
+sub wanted_height {
+    my ($content) = @_;
+    my @lines = grep { length($_) > 0 } split /\\n/, $content;
+    my $height = scalar(@lines) ? scalar(@lines) + 2 : 1;
+    $height = 14 if $height > 14;
+    $height = 1 if $height < 1;
+    return $height;
+}
+
+sub resize_self {
+    my ($height) = @_;
+    return unless $ENV{TMUX_PANE};
+    system('tmux', 'resize-pane', '-t', $ENV{TMUX_PANE}, '-y', $height);
+}
+
+sub clear_history {
+    return unless $ENV{TMUX_PANE};
+    system('tmux', 'clear-history', '-t', $ENV{TMUX_PANE});
+}
+
+sub redraw {
+    my ($content) = @_;
+    my $height = wanted_height($content);
+    resize_self($height);
+    clear_history();
+    print "\\x1b[3J\\x1b[2J\\x1b[H";
+    return unless length($content);
+    my @lines = grep { length($_) > 0 } split /\\n/, $content;
+    print "\n";
+    print $left_pad . join("\n" . $left_pad, @lines);
+    print "\n";
+}
+
+while (1) {
+    my $content = '';
+    if (-f $file && open my $fh, '<', $file) {
+        binmode($fh, ':utf8');
+        local $/;
+        $content = <$fh> // '';
+        close $fh;
+    }
+    if ($content ne $last) {
+        $last = $content;
+        redraw($content);
+    }
+    select(undef, undef, undef, 0.2);
+}
+`;
 }
 
 export function buildDisplayScript(): string {
